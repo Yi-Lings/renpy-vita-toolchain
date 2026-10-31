@@ -1,8 +1,18 @@
 # Ren'Py → PS Vita 移植工具链
 
-把 Ren'Py 游戏移植到 PS Vita 的一套脚本，配套踩坑文档。
+把 Ren'Py 游戏移植到 PS Vita 的一套脚本，配套踩坑文档、铁律和可复用 skill。
 
 适用于 **Ren'Py 7.x（Python 2.7）** → [renpy-vita](https://github.com/SonicMastr/renpy-vita) 运行时。
+
+---
+
+## 先读这三个
+
+| 文件 | 用途 |
+|---|---|
+| **[RULES.md](RULES.md)** | **15 条铁律**。每条对应一次真实踩坑，违反任意一条包就起不来 |
+| **[skills/renpy-vita-port/SKILL.md](skills/renpy-vita-port/SKILL.md)** | 可复用的移植 skill，给 AI agent 或自己按步骤执行 |
+| [docs/移植踩坑总结.md](docs/移植踩坑总结.md) | 完整过程记录，含成功日志与数据 |
 
 ---
 
@@ -13,11 +23,11 @@ Ren'Py 游戏直接丢给 Distribution Tool 打包，大概率卡在启动图然
 
 | 条件 | 为什么 |
 |---|---|
-| `renpy/common` 里有预编译 `.rpyc` | `app0:` 只读，否则每次启动现场编译 54 个脚本 |
-| `script_version.txt` 干净 | 汉化组的水印会让 `ast.literal_eval` 抛异常，兼容层静默失效 |
-| 没有 init 阶段的联网代码 | Vita 没有 SSL，requests 必炸 |
+| `renpy/common` 里有 54 个预编译 `.rpyc` | `app0:` 只读，否则每次启动现场编译 |
+| `script_version.txt` 干净（9~11 字节） | 汉化组水印会让 `ast.literal_eval` 抛异常，兼容层静默失效 |
+| 没有 init 阶段的联网代码 | Vita 没有 SSL，requests 必炸（17 个游戏里 11 个有） |
 | `libshacccg.suprx` 在 `ur0:/data/` | 所有 GL 程序的硬前置 |
-| 素材尺寸接近屏幕 | 1920×1440 的 CG 在 330 MB 内存的机器上解码非常慢 |
+| 素材尺寸/格式接近屏幕 | 1920×1440 PNG 解码 139ms，JPEG 只要 5.2ms |
 
 ---
 
@@ -58,15 +68,34 @@ python optimize_images.py game/img_resource.rpa game/img_opt.rpa --max-w 1366 --
 python optimize_images.py game/img_resource.rpa game/img_opt.rpa --dry-run   # 只统计
 ```
 
-做三件事：
-1. 超过框的等比缩到框内
-2. alpha 全 255 的 RGBA 转 RGB（省 25% 内存）
-3. PNG 用 `optimize` + `compress_level=9` 重存（重存后变大的保留原样）
+超过框的等比缩到框内；alpha 全 255 的 RGBA 转 RGB；PNG 重压。
+实测：144.5 MB → 42.3 MB，单张解码 83.6 ms → 19.4 ms。
 
-实测某游戏：144.5 MB → 42.3 MB，单张解码 83.6 ms → 19.4 ms。
+### `jpeg_recompress.py` — 不透明图转 JPEG（收益最大）
 
-> 关键认识：Ren'Py 的 virtual 分辨率决定了像素需求上限。超过的部分
-> 只增加解码时间和显存占用，画面上一点都看不出来。
+```bash
+python jpeg_recompress.py <src.rpa> <dst.rpa> --quality 85
+python jpeg_recompress.py <src.rpa> <dst.rpa> --dry-run
+```
+
+实测同一张 1024×768：
+
+| 格式 | 体积 | 解码 |
+|---|---|---|
+| PNG | 862 KB | **139.5 ms** |
+| JPEG q85 | 131 KB | **5.2 ms** |
+
+**体积 15%，解码快 27 倍。** 保留 `.png` 文件名即可 ——
+SDL_image 按内容嗅探，不看扩展名（已实测验证）。
+
+### `subset_font.py` — CJK 字体子集化
+
+```bash
+python subset_font.py 原字体.otf 输出.otf --charset charset.txt
+```
+
+字符集必须三层齐全：脚本用字 ∪ GB2312 全字库 ∪ ASCII/Latin-1/假名。
+实测 17.3 MB → 4.1 MB（省 76%）。
 
 ### `fix_script_version.py` — 清 `script_version.txt` 水印
 
@@ -75,9 +104,6 @@ python fix_script_version.py <游戏目录>            # 只报告
 python fix_script_version.py <游戏目录> --write    # 就地修正
 ```
 
-正常文件 9~11 字节：`(7, 4, 8)\n`。
-被污染的会是 32 字节，末尾多一行 GBK 中文。
-
 ### `fix_telemetry.py` — 检测首发联网上报
 
 ```bash
@@ -85,36 +111,21 @@ python fix_telemetry.py <游戏目录>                          # 只检测
 python fix_telemetry.py <游戏目录> --write --sdk <SDK路径>   # 生成补丁
 ```
 
-扫描 `splashscreen.rpyc` 里的 `init -3` 块，命中特征：
-`ipinfo.io` / `pipedream` / `stickyrice.work` / `users.cherrykiss.club` /
-`requests.get(` / `requests.post(`。
+### `build_package.py` — 打成可安装的包
 
-生成 `psv_skip_telemetry.rpyc`，内容是：
-
-```python
-init -10 python:
-    persistent.data_checked = True
+```bash
+python build_package.py --build <运行时目录> --game <game目录> \
+    --out dist --title-id ANGE00001
 ```
 
-`-10` 早于 `-3`，`if not persistent.data_checked` 直接跳过。
-
-**必须用 Ren'Py SDK 编译** —— 手写的 rpyc 版本常量对不上会被拒绝加载。
-当前运行时的要求是 `5003000`（`0x4C56F8`）。
+产出 `X_Runtime.vpk`（14 MB，可公开）、`X_Full.vpk`（含数据，勿公开）、
+`X_NoNpDrm.zip`。
 
 ### `make_scesys_generic.py` — 生成合规的 LiveArea 素材
 
 ```bash
 python make_scesys_generic.py <sce_sys目录> <logo.png> [alt.png] "标题"
 ```
-
-Vita 安装器**只接受 8-bit 索引色 PNG**，否则 `0x8010113D`：
-
-| 文件 | 尺寸 | 要求 |
-|---|---|---|
-| `icon0.png` | 128×128 | colortype=3, bit=8, 无 alpha |
-| `pic0.png` | 960×544 | 同上 |
-| `livearea/contents/bg.png` | 840×500 | 同上 |
-| `livearea/contents/startup.png` | 280×158 | 可有 alpha |
 
 ### 其它
 
@@ -123,6 +134,7 @@ Vita 安装器**只接受 8-bit 索引色 PNG**，否则 `0x8010113D`：
 | `fix_scesys_png.py` | 把已有 PNG 转成 8-bit 索引色 |
 | `pack_vpk2.py` | 按规范打包 VPK（param.sfo 优先、全 DEFLATE、ASCII 文件名） |
 | `rpa_inspect.py` | 统计 rpa 里的文件数/格式/分辨率/视频 |
+| `rpa_extract.py` | 从 rpa 提取指定文件 |
 
 ---
 
@@ -134,6 +146,8 @@ Vita 安装器**只接受 8-bit 索引色 PNG**，否则 `0x8010113D`：
    ├─ fix_script_version.py --write     清 script_version.txt 水印
    ├─ fix_telemetry.py --write --sdk    生成跳过上报的补丁
    ├─ optimize_images.py                降采样素材（性能）
+   ├─ jpeg_recompress.py                不透明图转 JPEG（性能，收益最大）
+   ├─ subset_font.py                    CJK 字体子集化（内存）
    ├─ rpa_tool.py filter                删无用翻译（启动速度）
    │
    ▼
@@ -158,10 +172,8 @@ USB 拷 game/*.rpa → ux0:/app/TITLEID/game/
 ## 诊断：怎么定位崩溃点
 
 1. **读 `log.txt`** — 最后一行是最后被 flush 的内容，**不是崩溃点**。
-   Ren'Py 的日志是行缓冲，真正的崩溃往往发生在最后一行之后几百毫秒。
 
-2. **解 `psp2core-*.psp2dmp`** — gzip 压缩的 ELF core。
-   解压后可以直接在内存里搜字符串找线索：
+2. **解 `psp2core-*.psp2dmp`** — gzip 压缩的 ELF core：
 
    ```python
    import gzip, re
@@ -171,23 +183,9 @@ USB 拷 game/*.rpa → ux0:/app/TITLEID/game/
            print(s)
    ```
 
-   我们就是靠这个在内存里搜到 `ipinfo.io` 才定位到上报块的。
+3. **反编译 `.rpyc`** — 用 [unrpyc](https://github.com/CensoredUsername/unrpyc)。
 
-3. **反编译 `.rpyc`** — 用 [unrpyc](https://github.com/CensoredUsername/unrpyc)：
-
-   ```bash
-   python unrpyc.py game/*.rpyc
-   ```
-
-   直接看 `init` 块里干了什么。
-
-4. **PC 上用同版本 SDK 复现** —
-
-   ```bash
-   renpy.exe <project> lint
-   ```
-
-   `lint` 会执行 init 代码，异常信息比 Vita 上详细得多。
+4. **PC 上用同版本 SDK 复现** — `renpy.exe <project> lint`，会执行 init 代码。
 
 ---
 
@@ -195,10 +193,9 @@ USB 拷 game/*.rpa → ux0:/app/TITLEID/game/
 
 * 运行时是 **Ren'Py 7.4.9**，Python 2.7.18
 * **7.3.5 和 7.4.8 的游戏都能跑** —— 版本跨度不是问题
-* `param.sfo` 用 mksfoex 生成的 **912 字节**就够注册气泡，不必用 1328 字节零售布局
-* `renpy/common` 必须是 **336 文件 / 54 个 `.rpyc`** 的那份
-* `renpy.py`（6,722 字节）和 `lib/python27.zip`（3,919,486 字节）
-  要保持 DistTool 原版，换成别的移植里的版本反而更糟
+* `param.sfo` 用 mksfoex 的 **912 字节**就够注册气泡
+* `renpy/common` 必须是 **336 文件 / 54 个 `.rpyc`**
+* `renpy.py`（6,722 字节）和 `lib/python27.zip`（3,919,486 字节）保持 DistTool 原版
 
 ---
 
@@ -207,7 +204,8 @@ USB 拷 game/*.rpa → ux0:/app/TITLEID/game/
 * 视频播放不支持（renpy-vita 的 C 层限制）
 * WebP 是否支持未确认
 * 退出游戏会崩（不影响存档）
-* 冷启动仍需 40-70 秒（存储卡慢 + rpa 索引解析）
+* 稳态帧率约 20 FPS（PowerVR SGX 543MP + 444MHz CPU 的渲染上限）
+* 冷启动 50-70 秒（存储卡慢 + 300 MB rpa 索引解析）
 
 ---
 
