@@ -53,3 +53,23 @@ init -9 python:
 
     # 自动存档 = 一次完整序列化 + 写存储卡，顿挫明显
     config.autosave_frequency = None
+
+    # ------------------------------------------------------------------
+    # 文字排版缓存放大
+    #
+    # text.py:1441  LAYOUT_CACHE_SIZE = 50
+    # text.py:2110  if len(layout_cache_new) > LAYOUT_CACHE_SIZE:
+    #                   layout_cache_new.clear()      # 整表清空，不是淘汰最旧
+    #
+    # 一个设置界面就有 35 个文本控件，加上导航按钮、say 屏、快捷菜单，
+    # 很容易越过 50 → 整表清空 → 下一帧所有文本重新排版 + 重建纹理。
+    #
+    # 缓存里存的是 GL 纹理（text.py:866），不是 surface，所以放大要保守：
+    # 一句台词约 900x60x4 ≈ 216 KB，120 项 ≈ 26 MB 上限。
+    # 先给 120（2.4 倍），配合 psv_diag 的缓存尺寸日志观察。
+    # ------------------------------------------------------------------
+    try:
+        import renpy.text.text as _psv_text
+        _psv_text.LAYOUT_CACHE_SIZE = 120
+    except Exception:
+        pass

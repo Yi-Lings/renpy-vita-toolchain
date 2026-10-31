@@ -1,4 +1,4 @@
----
+﻿---
 name: renpy-vita-port
 description: Port a Ren'Py game to PS Vita (renpy-vita runtime). Use when packaging a Ren'Py 7.x game for PS Vita, debugging a port stuck on the splash image, a C2-12828-1 crash at startup, an 0x8010113D install failure, or optimizing a working Vita port that stutters.
 ---
@@ -7,7 +7,7 @@ description: Port a Ren'Py game to PS Vita (renpy-vita runtime). Use when packag
 
 把 Ren'Py 游戏移植到 PS Vita。覆盖打包、启动失败排查、性能优化。
 
-**先读 `RULES.md`** —— 那是 17 条铁律，每条都对应一次真实踩坑。
+**先读 `RULES.md`** —— 那是 19 条铁律，每条都对应一次真实踩坑。
 
 ---
 

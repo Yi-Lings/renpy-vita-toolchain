@@ -281,67 +281,61 @@ PC 内存充足时这是个好开关，Vita 上不是。
 **开始**时调用，测出来的是「两次交互之间的时间」，**包含玩家看屏幕的时间**。
 数据完全没意义。
 
-### 12.2 第二层坑（更隐蔽）：`periodic_callbacks` 也测不准
+### 12.2 ⚠ 一次被实验推翻的错误结论（写在这里防止再犯）
 
-换成 `config.periodic_callbacks` 之后看着对了，但**仍然是假的**。
+**我一度认为**：`periodic_callbacks` 在等待输入时不跑，因为 interact 循环
+阻塞在 `event_wait()`（`core.py:3965`），所以测出来的「1.7 秒卡顿」
+其实是玩家读台词的时间。
 
-**原理**：`periodic_callback` 由 50ms 的 `PERIODIC` 定时器驱动。可是
-interact 循环在等待输入时会**阻塞在 `event_wait()`**：
-
-```python
-# renpy/display/core.py:3959-3966
-if needs_redraw or (not can_block) or ...:
-    ev = self.event_poll()
-else:
-    ev = self.event_wait()        # ← 阻塞在这里，定时器事件要等玩家按键才处理
-```
-
-于是「玩家读一行台词读 36 秒」被记成「卡顿 36 秒」。
-更隐蔽的是：**稳态 FPS 会恒等于 20.0**，因为 `1 / 0.05s = 20`——
-那是定时器周期，不是渲染帧率。看到 `PSV FPS 19.98 (avg 50 ms)`
-就以为「稳定 20 帧没问题」，其实是探针在自欺。
-
-**真机日志里的铁证**：
+**这个结论是错的。** 用一个最小工程实测（显示静态界面，完全不操作）：
 
 ```
-PSV FPS: 0.80 (avg 1244 ms, worst 35921 ms @ tl/zhcn/script.rpyc:102)
-PSV STALL 35.92s at tl/zhcn/script.rpyc:102
+PTEST calls=198 in 10.0s maxgap=0.052s
 ```
 
-那行台词是 `"《好色的脸》、《恶心的脸》——这是通过问卷调查送给隆司的同班同学的话。"`——
-普通对话，不可能卡 36 秒。真相是玩家在那句话上停了 36 秒。
+**10 秒内回调 198 次，最大间隔 52 ms。** pygame 的 timer 事件会正常唤醒
+`event_wait()`，回调照跑。
 
-**铁律**：测卡顿只能测**函数实际执行耗时**，不能测「两次回调的间隔」。
-包住 `Interface.draw_screen()` / `render.render_screen()`：
+**教训**：
 
-```python
-init -9 python:
-    import time as _t
+> 涉及「引擎某段代码到底跑不跑」的判断，必须写最小工程实测，
+> 不能靠读代码推理。我读了 `event_wait()` 就下结论，结果推翻了自己，
+> 而且用这个错误结论把用户真实的卡顿说成"假的"。
 
-    def _wrap(mod, attr, label):
-        orig = getattr(mod, attr)
-        def f(*a, **kw):
-            t0 = _t.time()
-            try:
-                return orig(*a, **kw)
-            finally:
-                d = _t.time() - t0
-                if d >= 0.35:
-                    renpy.write_log("PSV SLOW %.2fs %s", d, label)
-        setattr(mod, attr, f)
+**正确的态度**：探针读数可疑时，应该说"这个数可能不准，我换个测法确认"，
+而不是"你的卡顿不存在"。
 
-    _wrap(renpy.display.core.Interface, "draw_screen", "FRAME")
-    _wrap(renpy.display.render, "render_screen", "RENDER")
+**真正该怀疑的是**：`periodic_callback` 的间隔确实是主线程是否被占住的
+可靠指标。间隔 1.7 秒 = 主线程真的被占了 1.7 秒。
+问题只在于**不知道占在哪一段**——解决办法是分包住各个函数（见 12.3）。
+
+### 12.3 分包各阶段，直接测「操作延迟」
+
+用户说的卡顿几乎都是**操作卡顿**（按键 → 响应）。对应引擎里这条链：
+
+```
+事件入队 → interact 返回 → 新屏幕构建 → render → draw+flip
 ```
 
-`draw_screen` 在 idle 时**根本不会被调用**，所以计时是干净的。
-真要测帧率，读引擎自己的 `renpy.display.interface.frame_times`
-（5 秒滚动窗口，和 Shift+D 的 Performance 屏同一份数据），
-不要自己用定时器算。
+每一段单独计时，才能知道卡在哪。`patches/psv_diag.rpy` (v6) 的实现：
+
+| 标签 | 包住谁 |
+|---|---|
+| `LATENCY` | 按键时刻 → 下一帧画完（**用户感知的响应时间**） |
+| `SCREEN` | `ScreenDisplayable.update`（界面重建） |
+| `IMG` | `im.cache.get`（图片解码） |
+| `RENDER` | `render.render_screen`（文字排版+布局） |
+| `DRAW+FLIP` | `draw.draw_screen`（GL 提交+flip） |
+| `IDLE` | `Interface.idle_frame`（空闲期预加载/GC） |
+| `GC` | `gc.collect` |
+
+⚠ 注意 `renpy.display.draw` 在 `init` 阶段还是 `None`，纹理上传的探针
+必须延迟到第一次交互时再装，否则会报
+`AttributeError: 'NoneType' object has no attribute 'ready_one_texture'`。
 
 ---
 
-## 铁律 12b｜`config.periodic_callbacks` 只在「有帧」时跑
+## 铁律 12b｜`config.periodic_callbacks` 的间隔 ≈ 主线程忙闲晴雨表
 
 补一条上面没写透的：
 
@@ -352,13 +346,14 @@ if ev.type == PERIODIC:
         i()
 ```
 
-而 `PERIODIC` 事件是 `pygame.time.set_timer(PERIODIC, 50)` 发出来的。
-它进的是事件队列，**只有 interact 循环转到 `event_poll()` 才会被消费**。
-在 `event_wait()` 阻塞期间，队列里积压的 PERIODIC 事件不会执行回调。
-所以 periodic callback 的调用间隔 = `max(50ms, 玩家停顿时间)`。
+`PERIODIC` 由 `pygame.time.set_timer(PERIODIC, 50)` 产生，50ms 一次。
+**实测 idle 时它照常执行**（10 秒 198 次，最大间隔 52ms）。
 
-这条同样适用于**任何**依赖 periodic 的「后台任务」（包括官方
-`renpy.audio.audio.periodic()`）——在 Vita 上音频卡顿也可能与此有关。
+所以：**回调间隔超过 50ms 的部分，就是主线程被别的东西占住的时间。**
+这是个免费的「主线程阻塞探测器」——间隔 1.7 秒 = 真的卡了 1.7 秒。
+
+但它只能告诉你「什么时候卡了」，不能告诉你「卡在哪」。
+要定位得再分包各函数（见 12.3）。
 
 ---
 
@@ -490,6 +485,101 @@ for name, data in iter_rpa('gui_resource.rpa'):
 
 ---
 
+## 铁律 18｜文字渲染慢，先怀疑「字体在 .rpa 里被流式读取」
+
+**症状**：文字渲染占 90%+ 的卡顿时间，而且**耗时与文字长度不成比例**——
+`1.3.2` 五个 ASCII 字符要 0.56 秒，一句 32 字台词要 1.5 秒。
+
+**实测（Angel Sex Pet，2026-11-01）**：
+
+```
+PSV FRAME 10.23s | get=8(miss=5) 1.01s | text=10 9.12s | tex=0 0.00s
+PSV TEXT   0.56s size=16  '1.3.2'
+PSV TEXT   2.39s size=24  '开始游戏'
+PSV TEXT   3.45s size=22  '圣天使夏洛…'
+```
+
+在 PC 上用同一个 FreeType 实测同款字体：**0.039 ms/字**。
+按 Vita CPU 慢 50 倍折算也只有 2 ms/字，实测是 112–598 ms/字 —— **差 50–300 倍**。
+
+**任何「光栅化慢」的解释都填不平这个差距。差距来自 I/O。**
+
+### 原理
+
+`renpy/text/ftfont.pyx` 里 FreeType 用 `FT_OPEN_STREAM`，
+所有字体数据都走一个 **Python 回调**：
+
+```cython
+cdef unsigned long io_func(FT_Stream stream, unsigned long offset, ...):
+    f = face.f                    # 字体文件对象
+    if face.offset != offset:
+        f.seek(offset)            # ← 每次 seek
+    buf = f.read(count)           # ← 每次 read
+```
+
+而 `face.f` 是 `renpy.loader.load(fn)` 返回的 **`.rpa` 里的 SubFile**
+（`renpy/loader.py:475`，`read()` 内部会 `open(文件名)` + `f.read()`）。
+
+**于是每读一个字形轮廓 = Python 回调 + seek + 读一次几 MB 的 .rpa 文件。**
+CFF 字体读一个字形通常要读多处，一句 32 字台词 = 100–160 次磁盘 I/O。
+Vita 存储卡单次 seek+read 5–10 ms → **0.5–1.6 秒**，与实测吻合。
+
+### 修法（纯 Python，不动引擎二进制）
+
+让字体类文件整块读进内存，`SubFile` 换成 `BytesIO`：
+
+```python
+init -9 python:
+    import io
+    import renpy.loader as _ld
+
+    _orig_load = _ld.load
+    _FONT_EXT = (".ttf", ".otf", ".ttc", ".otc")
+
+    def _psv_load(name, *a, **kw):
+        f = _orig_load(name, *a, **kw)
+        try:
+            if name.lower().endswith(_FONT_EXT):
+                data = f.read()
+                f.close()
+                return io.BytesIO(data)
+        except Exception:
+            pass
+        return f
+
+    _ld.load = _psv_load
+```
+
+`load_face` 只对文件做 `seek(0,2)` / `tell()` / `seek(0,0)`，`BytesIO` 全支持。
+
+**代价**：字体常驻内存。3 个 CJK 字体各 4.1 MB ≈ 12.9 MB。Vita 约 330 MB 可用，可接受。
+
+### 怎么确认是这个问题
+
+在 `renpy.loader.load` 里计数，看字体文件的 `read()` 被调用多少次：
+
+```python
+count = [0]
+orig_read = ...   # 包装 SubFile.read
+```
+
+一句话台词若触发上百次读，基本就锁定了。
+
+---
+
+## 铁律 19｜别把「字体格式」当成文字慢的原因
+
+**踩过的坑**：怀疑 CFF（OTF）比 TrueType 光栅化慢，准备把 4.1 MB 的
+SourceHanSansSC 从 CFF 转成 glyf。
+
+**实测否掉了**：PC 上 CFF 光栅化 **0.039 ms/字**，转换后收益上限约 4%，
+而且 cu2qu 的二次贝塞尔近似 + 不同 hinting 引擎会带来亚像素级的视觉差异。
+
+**结论**：字体格式只在「CPU 光栅化确实是瓶颈」时才有意义。
+若耗时与字数**不成比例**（例如 5 个字符要 0.5 秒），问题一定在别处（见铁律 18）。
+
+---
+
 ## 附：一句话备忘
 
 | 现象 | 先查 |
@@ -505,3 +595,5 @@ for name, data in iter_rpa('gui_resource.rpa'):
 | 日志 `limit=25.0Mpx` 改不动 | Vita 的 `Cache.init()` 写死了，`image_cache_size_mb` 无效 |
 | `PSV FPS` 恒为 19.98 | periodic 定时器周期（50ms），不是渲染帧率 |
 | 菜单卡 10 秒 | 先查 `gui/main_menu.png` 的解码尺寸，别只看文件大小 |
+| 文字慢且耗时与字数不成比例 | 字体在 .rpa 里被流式读取，见铁律 18 |
+| 文字慢但耗时与字数成正比 | 才轮到字形复杂度 / 描边层数 / 字体格式 |
