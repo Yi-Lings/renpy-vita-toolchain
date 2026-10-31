@@ -7,7 +7,7 @@ description: Port a Ren'Py game to PS Vita (renpy-vita runtime). Use when packag
 
 把 Ren'Py 游戏移植到 PS Vita。覆盖打包、启动失败排查、性能优化。
 
-**先读 `RULES.md`** —— 那是 20 条铁律，每条都对应一次真实踩坑。
+**先读 `RULES.md`** —— 那是 22 条铁律，每条都对应一次真实踩坑。
 
 ---
 

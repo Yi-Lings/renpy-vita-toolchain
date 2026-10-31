@@ -603,6 +603,72 @@ SourceHanSansSC 从 CFF 转成 glyf。
 
 ---
 
+## 铁律 21｜`renpy/common` 必须与运行时**逐字节一致**
+
+**症状**：启动能跑，但 `Loading script took 52.01s`（参考包只要 37.48s），
+日志里有 `Save bytecode. took 0.92s`。
+
+**原因**：包里的 `renpy/common/*.rpyc` 和运行时不是同一份编译产物。
+
+实测（Angel Sex Pet，2026-11-01）对比三个来源的 `000atl.rpyc`：
+
+```
+参考包 RNPYSS001   2026 B   RENPY RPC2 + 版本 1.46
+我们的包           2024 B   RENPY RPC2 + 版本 1.46   ← 内容不同
+设备实际运行       2024 B   RENPY RPC2 + 版本 1.46   ← 内容又不同
+```
+
+格式版本一致，但字节码载荷不同 —— 因为运行时是 **`Ren'Py 7.4.9.0u`**（Vita 定制版），
+而 PC SDK 是 `7.4.9.2142`，两者编译出的 `.rpyc` 不一样。
+
+按目录逐文件 md5 比对：**336 个文件里 60 个（全部是 `.rpyc`/`.rpymc`）不一致**。
+
+**修法**：不要用 PC SDK 编出来的 `renpy/common`，直接**从能跑的设备上整目录复制**：
+
+```powershell
+Remove-Item build\<项目>\renpy\common\* -Recurse -Force
+Copy-Item G:\app\<TITLE_ID>\renpy\common\* build\<项目>\renpy\common\ -Recurse -Force
+```
+
+**验证**：逐文件 md5 应为 `336/336 一致`。`selfcheck_package.py` 的
+`--ref-common` 参数会自动做这个比对（检查项 21.1/21.2）。
+
+---
+
+## 铁律 22｜发版前必须跑 `selfcheck_package.py`
+
+**症状**：反复出现「装到 99% 失败」「启动卡住」「按键反了」这类问题，
+而且每次都是**装到机器上才发现**。
+
+**原因**：这些坑全部对应可静态检查的硬性规格，只是以前靠肉眼和记忆。
+
+**做法**：`tools/selfcheck_package.py` 把本文件的铁律变成 **84 项断言**：
+
+```bash
+python tools/selfcheck_package.py \
+    --vpk dist/<项目>/<项目>_Full.vpk \
+    --runtime dist/<项目>/<项目>_Runtime.vpk \
+    --ref-common G:/app/<TITLE_ID>/renpy/common
+```
+
+必须看到 `RESULT: PASS`。它覆盖：
+
+| 铁律 | 检查内容 |
+|---|---|
+| 5 | LiveArea PNG 是 8-bit 索引色、非隔行、命名为 `bg.png` |
+| 6 | 正斜杠、`param.sfo` 首条、ASCII 名、全 DEFLATE、无目录条目 |
+| 7 | `pic0.png` 960×544、`icon0.png` 128×128 |
+| 1 | 每个 `.rpy` 都有 `.rpyc`（`_compat`/`_layout` 的 `.rpym` 例外，已知正常） |
+| 2 | `script_version.txt` 干净且是合法元组 |
+| 8 | 每个 `.rpa` 索引可读 |
+| 16 | `psv_input.rpyc` 在包内 |
+| 21 | `renpy/common` 与参考目录逐字节一致 |
+| — | 原版尺寸（`eboot.bin`/`renpy.py`/`python27.zip`）、无调试残留 |
+
+**代价**：跑一次约 10 秒（要解 132 MB 的包）。**远比装一次机器便宜。**
+
+---
+
 ## 附：一句话备忘
 
 | 现象 | 先查 |
@@ -620,4 +686,6 @@ SourceHanSansSC 从 CFF 转成 glyf。
 | 菜单卡 10 秒 | 先查 `gui/main_menu.png` 的解码尺寸，别只看文件大小 |
 | 文字慢且耗时与字数不成比例 | 字体在 .rpa 里被流式读取，见铁律 18 |
 | 字体内存吃紧 | 先查 `dlc_*.rpa` 里有没有未子集化的完整字体（铁律 20） |
+| 启动能跑但 `Loading script` 特别慢 | `renpy/common` 与运行时不一致（铁律 21） |
+| 装机器才发现问题 | 先跑 `selfcheck_package.py`（铁律 22） |
 | 文字慢但耗时与字数成正比 | 才轮到字形复杂度 / 描边层数 / 字体格式 |
