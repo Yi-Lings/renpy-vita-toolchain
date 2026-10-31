@@ -1,4 +1,4 @@
-# Ren'Py → PS Vita 移植铁律
+﻿# Ren'Py → PS Vita 移植铁律
 
 > 从 2026-10-30/31 两天、17 个游戏、几十次真机崩溃里提炼出来的。
 > 每条都对应一次真实的踩坑。**违反任意一条，包就起不来。**
@@ -537,33 +537,40 @@ init -9 python:
     _FONT_EXT = (".ttf", ".otf", ".ttc", ".otc")
 
     def _psv_load(name, *a, **kw):
-        f = _orig_load(name, *a, **kw)
+        rv = _orig_load(name, *a, **kw)
         try:
             if name.lower().endswith(_FONT_EXT):
-                data = f.read()
-                f.close()
+                data = rv.read()
+                rv.close()
                 return io.BytesIO(data)
         except Exception:
             pass
-        return f
+        return rv
 
     _ld.load = _psv_load
 ```
 
 `load_face` 只对文件做 `seek(0,2)` / `tell()` / `seek(0,0)`，`BytesIO` 全支持。
 
-**代价**：字体常驻内存。3 个 CJK 字体各 4.1 MB ≈ 12.9 MB。Vita 约 330 MB 可用，可接受。
+**实测收益（Angel Sex Pet，真机）**：
+
+| 指标 | 修复前 | 修复后 | 提升 |
+|---|---|---|---|
+| 进设置 整帧 | 10.23s | **2.76s** | 3.7× |
+| 进设置 文字渲染 | 9.12s | **1.64s** | 5.6× |
+| 再进菜单 整帧 | 8.12s | **2.79s** | 2.9× |
+| 单个 `开始游戏` | 2.39s | **0.50s** | 4.8× |
+
+关键佐证：**只有字体加载方式变了，`get=`（图片解码）数字一字未动**，
+`text=` 掉了 3.5–5.6 倍。变量唯一，因果成立。
+
+**代价**：字体常驻内存。本项目 6 个字体共 **28.77 MB**（其中一个是 16 MB 未子集化的
+日文字体）。Vita 约 330 MB 可用，可接受；若紧张就先子集化大字体。
 
 ### 怎么确认是这个问题
 
-在 `renpy.loader.load` 里计数，看字体文件的 `read()` 被调用多少次：
-
-```python
-count = [0]
-orig_read = ...   # 包装 SubFile.read
-```
-
-一句话台词若触发上百次读，基本就锁定了。
+在 `renpy.loader.load` 里计数，看字体文件的 `read()` 被调用多少次；
+或者直接上修复，对比 `text=` 前后耗时。
 
 ---
 
@@ -577,6 +584,22 @@ SourceHanSansSC 从 CFF 转成 glyf。
 
 **结论**：字体格式只在「CPU 光栅化确实是瓶颈」时才有意义。
 若耗时与字数**不成比例**（例如 5 个字符要 0.5 秒），问题一定在别处（见铁律 18）。
+
+---
+
+## 铁律 20｜DLC 字体常常是完整字体，别忘了子集化
+
+**实际案例**：主游戏的 3 个 CJK 字体都子集化到 4.1 MB 了，但
+`dlc_japanese/font/SourceHanSans-Regular.otf` 是 **16.18 MB 完整字体**，
+只用来渲染语言菜单里的「日本語」一个按钮。
+
+在「铁律 18」的修复生效后，这个字体成了最大的单项：
+
+- 常驻内存 16 MB（占全部字体内存的 56%）
+- 首次使用 1.74s（读 16 MB）
+
+**铁律**：子集化时**必须扫所有 rpa**，包括 `dlc_*.rpa`。
+只在 `archive.rpa` 里找用字会漏掉 DLC 的文本和字体。
 
 ---
 
@@ -596,4 +619,5 @@ SourceHanSansSC 从 CFF 转成 glyf。
 | `PSV FPS` 恒为 19.98 | periodic 定时器周期（50ms），不是渲染帧率 |
 | 菜单卡 10 秒 | 先查 `gui/main_menu.png` 的解码尺寸，别只看文件大小 |
 | 文字慢且耗时与字数不成比例 | 字体在 .rpa 里被流式读取，见铁律 18 |
+| 字体内存吃紧 | 先查 `dlc_*.rpa` 里有没有未子集化的完整字体（铁律 20） |
 | 文字慢但耗时与字数成正比 | 才轮到字形复杂度 / 描边层数 / 字体格式 |
