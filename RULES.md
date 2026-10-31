@@ -309,6 +309,32 @@ renpy.exe <project> lint
 
 ---
 
+## 铁律 16｜`renpy.input()` 在 Vita 上必卡死
+
+**症状**：设置里点「改名 / Change Name」后整个游戏冻结，按键无反应，只能强退。
+
+**原理**：`renpy.input()` 会走 SDL 的文本输入（Vita 上是系统输入法 / IME）。
+renpy-vita 的 SDL 移植没有实现这条路，事件循环永远等不到 `TEXTINPUT` 事件，
+于是永久阻塞。
+
+**铁律**：**任何 `renpy.input()` 调用都必须替换成引擎内的屏幕键盘。**
+
+`patches/psv_input.rpy` 提供了一个可直接用的实现：
+
+```python
+init 999 python:
+    if not getattr(renpy, "_psv_input_patched", False):
+        renpy.input = psv_input      # psv_input 用 renpy.call_screen("psv_keyboard")
+        renpy._psv_input_patched = True
+```
+
+配套的 `screen psv_keyboard` 提供 A–Z / 0–9 / 空格 / 删除 / 清空 / 确定 /
+取消，外加常用名字快捷按钮，完全不碰系统输入法。
+
+外层要包 `try/except` 并返回 `default`，保证任何意外都不会把游戏锁死。
+
+---
+
 ## 附：一句话备忘
 
 | 现象 | 先查 |
