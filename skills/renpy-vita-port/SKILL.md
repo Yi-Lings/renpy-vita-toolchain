@@ -7,7 +7,7 @@ description: Port a Ren'Py game to PS Vita (renpy-vita runtime). Use when packag
 
 把 Ren'Py 游戏移植到 PS Vita。覆盖打包、启动失败排查、性能优化。
 
-**先读 `RULES.md`** —— 那是 15 条铁律，每条都对应一次真实踩坑。
+**先读 `RULES.md`** —— 那是 17 条铁律，每条都对应一次真实踩坑。
 
 ---
 
@@ -80,27 +80,46 @@ python tools/fix_telemetry.py <游戏目录> --write --sdk <SDK路径>
 ### 阶段 4｜素材优化（如果有性能要求）
 
 ```bash
-# 4a 降采样（1920x1440 -> 1024x768）
-python tools/optimize_images.py game/img_resource.rpa game/img_opt.rpa --max-w 1366 --max-h 768
+# 4a 降采样 + 转 JPEG —— 必须一条命令做完（见铁律 17）
+python tools/jpeg_recompress.py game/gui_resource.rpa game/gui_opt.rpa \
+    --quality 88 --max-w 1366 --max-h 768
+python tools/jpeg_recompress.py game/img_resource.rpa game/img_opt.rpa \
+    --quality 88 --max-w 1366 --max-h 768
 
-# 4b 不透明图转 JPEG（保留 .png 文件名）
-python tools/jpeg_recompress.py game/img_opt.rpa game/img_opt2.rpa --quality 85
-
-# 4c 字体子集化
+# 4b 字体子集化
 python tools/subset_font.py 原字体.otf 输出.otf --charset charset.txt
 
-# 4d 删无用翻译
+# 4c 删无用翻译
 python tools/rpa_tool.py filter game/archive.rpa game/archive_opt.rpa --drop 'tl/en/,tl/es/'
 ```
 
-顺序不能乱：**先降采样 → 再转 JPEG**。
+**不要在两步之间重新打包**——`optimize_images.py` 之后再跑
+`jpeg_recompress.py` 时，务必确认输入是**原始 rpa**，不是上一步的产物。
+
+**验收标准：逐张检查解码像素数，不是文件大小。**
+
+```python
+for name, data in iter_rpa('gui_resource.rpa'):
+    im = Image.open(io.BytesIO(data))
+    if im.width > 1400 or im.height > 800:
+        print('漏了!', name, im.size)      # 必须为空
+```
+
+`gui/main_menu.png`、`gui/game_menu.png`、`gui/disclaimer.png` 这三张
+最容易漏——游戏里写死了 `size=(1024, 768)`，原图却是 1920×1440。
 
 ### 阶段 5｜性能配置
 
 ```python
 init -9 python:
-    config.image_cache_size_mb = 192     # 别低于 128，见铁律 9
-    config.predict_statements  = 32      # 别调小
+    # ⚠ Vita 的 Cache.init() 写死 cache_limit = 26214400（25.0 Mpx），
+    #   image_cache_size_mb 无论写多少都不生效（铁律 9.1）。
+    #   这里写的值只在 PC 上有效，留着保持一致。
+    config.image_cache_size_mb = 192
+
+    # ⚠ 不要开 cache_surfaces：会把 Surface 和纹理都计入同一个 25Mpx 上限，
+    #   能装的图少一半。
+    config.predict_statements  = 24       # 缓存小，预测别开太大
     config.hard_rollback_limit = 20
     config.autosave_frequency  = None
 ```
@@ -150,23 +169,35 @@ python tools/build_package.py \
 
 ## 性能优化
 
-**先测，再改。** 用 `periodic_callbacks` 测真实 FPS（铁律 12）。
+**先测，再改。** 而且要用**正确的**测法 —— 见铁律 12：
+`periodic_callbacks` 在等待输入时不跑，测出来的「卡顿」是玩家思考时间，
+「FPS」恒等于定时器周期的倒数（20.0），全是假的。
+
+正确做法：包 `Interface.draw_screen()` / `render.render_screen()` 测真实耗时。
+现成实现见 `patches/psv_diag.rpy`。
 
 **读法**：
 
 | 现象 | 结论 | 动作 |
 |---|---|---|
-| 稳态 FPS 低（< 25） | 渲染瓶颈 | 降素材尺寸、减图层 |
-| 稳态正常但 `worst` 几千 ms | 一次性加载 | 转 JPEG、加缓存、预载 |
-| 两者都差 | 先解决加载 | 再做渲染 |
+| `FRAME` 单次几千 ms，且位置在菜单/界面 | 界面首次构建 | 查该界面的背景图尺寸 |
+| `RENDER` 持续几十~几百 ms | 布局/文字排版 | 查字体子集、描边层数 |
+| `LOAD` 单次 > 0.5s | 从 rpa 读大文件 | 查语音/图片是否过大 |
 
 **优化优先级**（按收益排序）：
 
-1. **转 JPEG** —— 解码快 27 倍，收益最大（铁律 10）
-2. **降采样** —— 像素少 3.5 倍
+1. **降采样 + 转 JPEG（一条命令）** —— 解码快 27 倍，收益最大（铁律 10、17）
+2. **检查菜单背景图** —— `gui_*/main_menu/game_menu/disclaimer` 常被漏掉
 3. **字体子集化** —— 省 40 MB 常驻内存（铁律 11）
 4. **删无用翻译** —— 启动快 30%
-5. **缓存调到 192 MB** —— 别调小（铁律 9）
+5. **`config.predict_statements = 24`** —— 缓存只有 25Mpx，预测别开太大
+
+⚠ **不要再试图调 `config.image_cache_size_mb`** —— Vita 的
+`Cache.init()` 第一行就 `if renpy.vita: cache_limit = 26214400`，
+你写的值根本走不到。日志里永远是 `limit=25.0Mpx`。
+
+⚠ **也不要开 `config.cache_surfaces`** —— Surface 和纹理都会计入同一个
+25Mpx 上限，能装的图少一半。
 
 ---
 

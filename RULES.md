@@ -197,6 +197,42 @@ config.predict_statements  = 32     # 不要调小
 
 「内存小所以要设小缓存」是**反直觉的错误**。
 
+### 9.1 ⚠ 但在 Vita 上这个配置**根本不生效**（2026-10-31 反汇编确认）
+
+反汇编 `lib/python27.zip` 里的 `renpy/display/im.pyo`，`Cache.init()` 是：
+
+```python
+def init(self):
+    if renpy.vita:
+        self.cache_limit = int(26214400)          # ← 写死 25.0 Mpx = 100 MB
+    elif renpy.config.image_cache_size is not None:
+        self.cache_limit = 2 * config.image_cache_size * sw * sh
+    else:
+        self.cache_limit = int(config.image_cache_size_mb * 1024 * 1024 // 4)
+```
+
+**Vita 分支排在最前面**，所以无论你写 64、192 还是 300，日志里永远是
+
+```
+PSV CFG: cache_mb=192 cache_size=None limit=25.0Mpx ...
+```
+
+`limit=25.0Mpx` = `26214400 / 1024 / 1024 = 25.0`，正是那个常量。
+
+**怎么验证**：日志里 `limit` 永远是 25.0Mpx 就说明你命中的是这个分支。
+想确认自己的补丁有没有生效，只能看 `cache_mb=` 后面的值变了没有——
+但那个值对缓存上限**没有任何影响**。
+
+**结论**：在 Vita 上优化缓存只有两条路——
+1. **减小每张图的像素数**（降采样）→ 同样的 25Mpx 能装更多张
+2. **减小每张图的解码开销**（PNG → JPEG）→ 淘汰后重解的代价低 27 倍
+
+⚠ **不要开 `config.cache_surfaces = True`。** 默认 `False` 时，纹理上传到
+GPU 后 Ren'Py 会丢掉解码出来的 Surface（`im.py:332-337`）；改成 `True`
+会同时保留 Surface 和解码纹理，两者都计入 `CacheEntry.size()`
+（`width*height + bounds`）—— 同一个 25Mpx 上限下能装的图**少一半**。
+PC 内存充足时这是个好开关，Vita 上不是。
+
 ---
 
 ## 铁律 10｜图片格式比分辨率重要得多
@@ -239,30 +275,90 @@ config.predict_statements  = 32     # 不要调小
 
 ## 铁律 12｜诊断要测「帧」，不是「交互间隔」
 
+### 12.1 第一层坑：`interact_callbacks` 测的是玩家思考时间
+
 **踩过的坑**：用 `config.interact_callbacks` 测卡顿 —— 它在交互
 **开始**时调用，测出来的是「两次交互之间的时间」，**包含玩家看屏幕的时间**。
 数据完全没意义。
 
-**铁律**：测卡顿用 `config.periodic_callbacks`（每帧调用）算真实 FPS：
+### 12.2 第二层坑（更隐蔽）：`periodic_callbacks` 也测不准
+
+换成 `config.periodic_callbacks` 之后看着对了，但**仍然是假的**。
+
+**原理**：`periodic_callback` 由 50ms 的 `PERIODIC` 定时器驱动。可是
+interact 循环在等待输入时会**阻塞在 `event_wait()`**：
+
+```python
+# renpy/display/core.py:3959-3966
+if needs_redraw or (not can_block) or ...:
+    ev = self.event_poll()
+else:
+    ev = self.event_wait()        # ← 阻塞在这里，定时器事件要等玩家按键才处理
+```
+
+于是「玩家读一行台词读 36 秒」被记成「卡顿 36 秒」。
+更隐蔽的是：**稳态 FPS 会恒等于 20.0**，因为 `1 / 0.05s = 20`——
+那是定时器周期，不是渲染帧率。看到 `PSV FPS 19.98 (avg 50 ms)`
+就以为「稳定 20 帧没问题」，其实是探针在自欺。
+
+**真机日志里的铁证**：
+
+```
+PSV FPS: 0.80 (avg 1244 ms, worst 35921 ms @ tl/zhcn/script.rpyc:102)
+PSV STALL 35.92s at tl/zhcn/script.rpyc:102
+```
+
+那行台词是 `"《好色的脸》、《恶心的脸》——这是通过问卷调查送给隆司的同班同学的话。"`——
+普通对话，不可能卡 36 秒。真相是玩家在那句话上停了 36 秒。
+
+**铁律**：测卡顿只能测**函数实际执行耗时**，不能测「两次回调的间隔」。
+包住 `Interface.draw_screen()` / `render.render_screen()`：
 
 ```python
 init -9 python:
     import time as _t
-    _s = [_t.time(), 0, 0.0, 0.0]
-    def _probe():
-        now = _t.time(); d = now - _s[0]; _s[0] = now
-        _s[1] += 1; _s[2] += d; _s[3] = max(_s[3], d)
-        if _s[1] >= 30:
-            renpy.write_log("PSV FPS: %.2f (avg %.0f ms, worst %.0f ms)",
-                            1.0/max(_s[2]/_s[1], 1e-4), _s[2]/_s[1]*1000, _s[3]*1000)
-            _s[1] = 0; _s[2] = 0.0; _s[3] = 0.0
-    config.periodic_callbacks.append(_probe)
+
+    def _wrap(mod, attr, label):
+        orig = getattr(mod, attr)
+        def f(*a, **kw):
+            t0 = _t.time()
+            try:
+                return orig(*a, **kw)
+            finally:
+                d = _t.time() - t0
+                if d >= 0.35:
+                    renpy.write_log("PSV SLOW %.2fs %s", d, label)
+        setattr(mod, attr, f)
+
+    _wrap(renpy.display.core.Interface, "draw_screen", "FRAME")
+    _wrap(renpy.display.render, "render_screen", "RENDER")
 ```
 
-**读法**：
-- 稳态 FPS 低 → 渲染瓶颈
-- 稳态正常但 `worst` 有几千 ms → 一次性加载/编译瓶颈
-- 两者都低 → 先解决加载，再看渲染
+`draw_screen` 在 idle 时**根本不会被调用**，所以计时是干净的。
+真要测帧率，读引擎自己的 `renpy.display.interface.frame_times`
+（5 秒滚动窗口，和 Shift+D 的 Performance 屏同一份数据），
+不要自己用定时器算。
+
+---
+
+## 铁律 12b｜`config.periodic_callbacks` 只在「有帧」时跑
+
+补一条上面没写透的：
+
+```python
+# renpy/display/core.py:4013   PERIODIC 事件处理
+if ev.type == PERIODIC:
+    for i in renpy.config.periodic_callbacks:
+        i()
+```
+
+而 `PERIODIC` 事件是 `pygame.time.set_timer(PERIODIC, 50)` 发出来的。
+它进的是事件队列，**只有 interact 循环转到 `event_poll()` 才会被消费**。
+在 `event_wait()` 阻塞期间，队列里积压的 PERIODIC 事件不会执行回调。
+所以 periodic callback 的调用间隔 = `max(50ms, 玩家停顿时间)`。
+
+这条同样适用于**任何**依赖 periodic 的「后台任务」（包括官方
+`renpy.audio.audio.periodic()`）——在 Vita 上音频卡顿也可能与此有关。
 
 ---
 
@@ -335,6 +431,65 @@ init 999 python:
 
 ---
 
+## 铁律 17｜降采样和转 JPEG 必须同一个工具一次做完
+
+**症状**：明明跑过「图片优化」，日志里还是动辄 10 秒的菜单卡顿。
+
+**实际案例（2026-10-31）**：上一轮优化分两步做——
+
+```
+1. optimize_images.py   → 降采样 1920x1440 → 1024x768
+2. jpeg_recompress.py   → PNG → JPEG
+```
+
+但第二步是从**已经被重新打包过的 rpa** 上再跑的，而 `gui_resource.rpa`
+里的
+
+```
+gui/main_menu.png    1920x1440 RGB   2.0 MB
+gui/game_menu.png    1920x1440 RGB   412 KB
+gui/disclaimer.png   1920x1440 RGBA  308 KB
+```
+
+只走了 JPEG、**没走降采样**（`optimize_images` 的 `max-w/max-h` 忘了传，
+或者跑的是另一个目录）。结果这三张图仍然是 1920×1440，只是换成了 JPEG。
+而游戏里写死了 `size=(1024, 768)`：
+
+```python
+image main_menu = Transform("gui/main_menu.png", size=(1024, 768))
+image game_menu = Transform("gui/game_menu.png", size=(1024, 768))
+image disclaim_idle = Transform("gui/disclaimer.png", size=(1024, 768))
+```
+
+**解码一张 1920×1440 RGBA = 11 MB**，缩到 1024×768 之后只剩 3 MB。
+每次进主菜单都要重解这三张 → 10 秒卡顿。
+
+**铁律**：
+
+> **降采样和转 JPEG 必须在同一个命令里一次完成。**
+> 分成两步跑，第二步很容易建立在第一步的产物上，而漏掉真正的原图。
+
+`jpeg_recompress.py` 已经加了 `--max-w/--max-h`：
+
+```bash
+python jpeg_recompress.py <src.rpa> <dst.rpa> \
+    --quality 88 --max-w 1366 --max-h 768
+```
+
+**验证方法（必须做）**：打开产物 rpa，逐张检查**解码后的像素数**，
+不是看文件大小：
+
+```python
+for name, data in iter_rpa('gui_resource.rpa'):
+    im = Image.open(io.BytesIO(data))
+    if im.width > 1400 or im.height > 800:
+        print('漏了!', name, im.size)
+```
+
+文件大小会骗人（JPEG 小但像素多），**像素数不会**。
+
+---
+
 ## 附：一句话备忘
 
 | 现象 | 先查 |
@@ -344,6 +499,9 @@ init 999 python:
 | 停在静态图 | 那是 `pic0.png`，引擎没起来 |
 | 日志缺 `Set script version to:` | `script_version.txt` 被污染 |
 | 日志缺 `Running init code` | init 里有联网/危险调用 |
-| 黑屏有声音 | 渲染/素材问题 |
+| 黑屏有声音 | 渲染/素材有问题 |
 | 机器自动重启 | 内核级故障（模块 panic） |
 | `Could not load from archive` | rpa 的 prefix 用了 `str ''` |
+| 日志 `limit=25.0Mpx` 改不动 | Vita 的 `Cache.init()` 写死了，`image_cache_size_mb` 无效 |
+| `PSV FPS` 恒为 19.98 | periodic 定时器周期（50ms），不是渲染帧率 |
+| 菜单卡 10 秒 | 先查 `gui/main_menu.png` 的解码尺寸，别只看文件大小 |
